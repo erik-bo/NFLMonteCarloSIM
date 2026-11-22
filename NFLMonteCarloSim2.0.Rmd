@@ -1,0 +1,152 @@
+---
+title: "NFLMonteCarloSim2.0"
+output: github_document
+date: "2026-11-22"
+---
+
+```{r}
+# ========================================================
+# NFL Playoff Probabilities - HIGH PERFORMANCE VERSION Updated for Off vs Def match ups, individual team pace, and predictive penalties 1/15/26
+# ========================================================
+library(nflfastR)
+library(nflseedR)
+library(nflreadr)
+library(dplyr)
+library(future)
+
+# 1) Load Data 
+# --------------------------------------------------------
+season_year <- 2026
+pbp <- nflfastR::load_pbp(season_year)
+games_raw <- nflreadr::load_schedules(seasons = season_year)
+
+# 2) Define Stable Penalty Lists
+# --------------------------------------------------------
+stable_off_penalties <- c("False Start", "Offensive Holding", "Defensive Offside")
+stable_def_penalties <- c("Defensive Offside", "Defensive Pass Interference")
+
+# 3) Calculate Team Strength with Penalty Reversion
+# --------------------------------------------------------
+message("Calculating Penalty-Adjusted Team Strength...")
+
+pbp_adjusted <- pbp |>
+  filter(!is.na(epa), !is.na(wp), wp >= 0.05 & wp <= 0.95) |>
+  mutate(
+    # Identify penalized team (Standard nflfastR schema)
+    is_off_penalty = ifelse(penalty == 1 & penalty_team == posteam, 1, 0),
+    is_def_penalty = ifelse(penalty == 1 & penalty_team == defteam, 1, 0),
+    
+    # Logic: Keep observed EPA for stable flags, 0 (neutral) for unstable ones.
+    adj_epa = case_when(
+      # STABLE OFFENSE: Account for discipline or drawing offsides
+      is_off_penalty == 1 & penalty_type %in% stable_off_penalties ~ epa,
+      is_def_penalty == 1 & penalty_type == "Defensive Offside" ~ epa,
+      
+      # STABLE DEFENSE: Account for systematic aggressiveness (DPI)
+      is_def_penalty == 1 & penalty_type %in% stable_def_penalties ~ epa,
+      
+      # UNSTABLE NOISE: Set to 0 (Reverts play to a "net zero" impact)
+      penalty == 1 ~ 0,
+      
+      # CLEAN PLAYS: Keep original EPA
+      TRUE ~ epa
+    )
+  )
+
+# Separate Offense and Defense Efficiency
+off_strength <- pbp_adjusted |>
+  group_by(team = posteam) |>
+  summarise(off_epa = mean(adj_epa, na.rm = TRUE), .groups = "drop")
+
+def_strength <- pbp_adjusted |>
+  group_by(team = defteam) |>
+  summarise(def_epa = mean(adj_epa, na.rm = TRUE), .groups = "drop")
+
+# Calculate Matchup Pace (Offensive tempo vs. Defensive plays allowed)
+raw_pace_off <- pbp |>
+  filter(play_type %in% c("pass", "run"), !is.na(posteam)) |>
+  group_by(game_id, team = posteam) |>
+  summarise(plays = n(), .groups = "drop") |>
+  group_by(team) |>
+  summarise(off_pace = mean(plays, na.rm = TRUE), .groups = "drop")
+
+raw_pace_def <- pbp |>
+  filter(play_type %in% c("pass", "run"), !is.na(defteam)) |>
+  group_by(game_id, team = defteam) |>
+  summarise(plays_allowed = n(), .groups = "drop") |>
+  group_by(team) |>
+  summarise(def_pace = mean(plays_allowed, na.rm = TRUE), .groups = "drop")
+
+# Final Combined Table
+team_strength <- off_strength |>
+  inner_join(def_strength, by = "team") |>
+  left_join(raw_pace_off, by = "team") |>
+  left_join(raw_pace_def, by = "team") |>
+  mutate(tot_epa = off_epa - def_epa) |>
+  mutate(wt_tot_epa = 1.1 * off_epa - def_epa)
+
+# 4) Vectorized Matchup-Specific Simulation Function
+# --------------------------------------------------------
+compute_epa_results_fast <- function(teams, games, week_num, ...) {
+  args <- list(...)
+  ts <- args$team_strength
+  hfa_pts <- args$home_field_adv
+  
+  idx <- which(is.na(games$result) & games$week == week_num)
+  if(length(idx) == 0) return(list(games = games, teams = teams))
+  
+  h_idx <- match(games$home_team[idx], ts$team)
+  a_idx <- match(games$away_team[idx], ts$team)
+  
+  # Predict EPA/play with 1.1x weight for offensive stability
+  h_exp_epa <- (1.1 * ts$off_epa[h_idx] + ts$def_epa[a_idx])
+  a_exp_epa <- (1.1 * ts$off_epa[a_idx] + ts$def_epa[h_idx])
+  
+  # MATCHUP PACE LOGIC:
+  # Home score = Home Offense Pace vs. Away Defense Pace Allowed
+  h_matchup_plays <- (ts$off_pace[h_idx] + ts$def_pace[a_idx]) / 2
+  # Away score = Away Offense Pace vs. Home Defense Pace Allowed
+  a_matchup_plays <- (ts$off_pace[a_idx] + ts$def_pace[h_idx]) / 2
+  
+  # Calculate point expectations per side
+  h_expected_pts <- h_exp_epa * h_matchup_plays
+  a_expected_pts <- a_exp_epa * a_matchup_plays
+  
+  # Apply Home Field Advantage and Game-Level Noise
+  game_noise_sd <- 13.7
+  hfa_vec <- ifelse(games$location[idx] == "Neutral", 0, hfa_pts)
+  
+  expected_margin <- (h_expected_pts - a_expected_pts) + hfa_vec
+  games$result[idx] <- rnorm(length(idx), mean = expected_margin, sd = game_noise_sd)
+  
+  return(list(games = games, teams = teams))
+}
+
+# 5) Simulation Execution
+# --------------------------------------------------------
+options(future.globals.maxSize = 1500 * 1024^2) 
+plan(multisession, workers = 2)
+set.seed(42)
+
+message("Simulating 50k seasons with Matchup-Pace Logic...")
+
+sim <- nflseedR::nfl_simulations(
+  games = games_raw,
+  compute_results = compute_epa_results_fast,
+  team_strength = team_strength,
+  home_field_adv = 1.9, 
+  simulations = 50000,
+  save_simulations = TRUE
+)
+
+plan(sequential)
+
+# 6) Final Super Bowl Odds
+# --------------------------------------------------------
+playoff_odds <- sim$overall |>
+  select(team, playoff, div1, seed1, won_conf, won_sb) %>%
+  arrange(desc(won_sb))
+
+print(playoff_odds)
+```
+
